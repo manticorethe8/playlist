@@ -10,24 +10,25 @@ app.use(express.json());
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 app.get('/api/extract', async (req, res) => {
   const { type = 'movie', id, season = '1', episode = '1' } = req.query;
 
   if (!id) {
-    return res.status(400).json({ success: false, error: 'TMDB or MAL ID parameter required' });
+    return res.status(400).json({ success: false, error: 'TMDB ID required' });
   }
 
   let embedUrl = `https://vidlink.pro/${type}/${id}`;
   if (type === 'tv') {
     embedUrl += `/${season}/${episode}`;
   }
+  embedUrl += '?autoplay=true';
 
   let browser = null;
 
   try {
-    console.log(`[+] [${new Date().toISOString()}] Intercepting: ${embedUrl}`);
+    console.log(`[+] Intercepting VidLink: ${embedUrl}`);
 
     browser = await chromium.launch({
       headless: true,
@@ -35,40 +36,74 @@ app.get('/api/extract', async (req, res) => {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--no-first-run',
-        '--no-zygote'
+        '--use-gl=swiftshader'
       ]
     });
 
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 720 }
+      viewport: { width: 1280, height: 720 },
+      deviceScaleFactor: 1,
+      isMobile: false,
+      hasTouch: false,
+      locale: 'en-US',
+      timezoneId: 'America/New_York'
     });
 
     const page = await context.newPage();
+
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    });
+
     let detectedStreamUrl = null;
 
     page.on('request', (request) => {
       const url = request.url();
-      if ((url.includes('.m3u8') || url.includes('/playlist/') || url.includes('/hls/')) && !detectedStreamUrl) {
-        console.log(`[!] Captured Stream: ${url}`);
+      if ((url.includes('.m3u8') || url.includes('/playlist/') || url.includes('/hls/') || url.includes('.mpd')) && !detectedStreamUrl) {
+        console.log(`[!] Captured Stream Request: ${url}`);
         detectedStreamUrl = url;
       }
     });
 
-    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await page.waitForTimeout(3000);
+    page.on('response', async (response) => {
+      if (detectedStreamUrl) return;
+      const url = response.url();
+      const contentType = response.headers()['content-type'] || '';
+
+      if (contentType.includes('mpegurl') || contentType.includes('x-mpegurl') || contentType.includes('vnd.apple.mpegurl')) {
+        console.log(`[!] Captured Stream Content-Type: ${url}`);
+        detectedStreamUrl = url;
+      }
+    });
+
+    await page.goto(embedUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(4000);
 
     if (!detectedStreamUrl) {
-      try {
-        const playBtn = page.locator('video, button, div[class*="play"]').first();
-        if (await playBtn.isVisible()) {
-          await playBtn.click({ force: true });
-          await page.waitForTimeout(3000);
-        }
-      } catch (e) {}
+      console.log('[*] Attempting player click interactions...');
+      const mainPlay = page.locator('video, button, iframe, div[class*="play"], div[class*="player"]').first();
+      if (await mainPlay.isVisible().catch(() => false)) {
+        await mainPlay.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(3000);
+      }
+
+      for (const frame of page.frames()) {
+        if (detectedStreamUrl) break;
+        try {
+          const framePlay = frame.locator('video, button, div[class*="play"]').first();
+          if (await framePlay.isVisible().catch(() => false)) {
+            await framePlay.click({ force: true }).catch(() => {});
+            await page.waitForTimeout(2000);
+          }
+        } catch (e) {}
+      }
     }
 
     await browser.close();
@@ -89,7 +124,10 @@ app.get('/api/extract', async (req, res) => {
         }
       });
     } else {
-      return res.status(404).json({ success: false, error: 'Stream not detected or protected.' });
+      return res.status(404).json({
+        success: false,
+        error: 'Stream link not detected. VidLink may be blocking datacenter IPs or requiring manual Cloudflare verification.'
+      });
     }
 
   } catch (err) {
