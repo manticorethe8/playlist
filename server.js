@@ -8,20 +8,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve custom HLS web player
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 
-/**
- * 1. Playwright Stream Extractor Endpoint
- * Spawns a headless Chromium instance to execute player JS and capture .m3u8 URLs.
- */
 app.get('/api/extract', async (req, res) => {
   const { type = 'movie', id, season = '1', episode = '1' } = req.query;
 
   if (!id) {
-    return res.status(400).json({ success: false, error: 'TMDB or MAL ID required' });
+    return res.status(400).json({ success: false, error: 'TMDB or MAL ID parameter required' });
   }
 
   let embedUrl = `https://vidlink.pro/${type}/${id}`;
@@ -55,7 +50,6 @@ app.get('/api/extract', async (req, res) => {
     const page = await context.newPage();
     let detectedStreamUrl = null;
 
-    // Listen for m3u8 playlist requests
     page.on('request', (request) => {
       const url = request.url();
       if ((url.includes('.m3u8') || url.includes('/playlist/') || url.includes('/hls/')) && !detectedStreamUrl) {
@@ -67,7 +61,6 @@ app.get('/api/extract', async (req, res) => {
     await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     await page.waitForTimeout(3000);
 
-    // Click play container if stream didn't trigger automatically
     if (!detectedStreamUrl) {
       try {
         const playBtn = page.locator('video, button, div[class*="play"]').first();
@@ -105,9 +98,6 @@ app.get('/api/extract', async (req, res) => {
   }
 });
 
-/**
- * 2. Segment CORS & Referer Proxy Engine
- */
 app.get('/api/proxy', async (req, res) => {
   const { url } = req.query;
 
