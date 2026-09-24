@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: vidlink-stream-extractor
+    name: stream-extractor-proxy
     env: docker
     plan: free
     region: oregon
@@ -8,3 +8,9 @@ services:
     envVars:
       - key: PORT
         value: 10000
+      - key: PROXY_SERVER
+        value: ""
+      - key: PROXY_USERNAME
+        value: ""
+      - key: PROXY_PASSWORD
+        value: ""

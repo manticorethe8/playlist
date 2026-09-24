@@ -12,97 +12,92 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 10000;
 
+/**
+ * Helper to launch Playwright with optional proxy configuration
+ */
+async function launchBrowser() {
+  const launchOptions = {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
+  };
+
+  // Attach Proxy if provided via environment variables (required for datacenter hosts like Render)
+  if (process.env.PROXY_SERVER) {
+    launchOptions.proxy = {
+      server: process.env.PROXY_SERVER
+    };
+    if (process.env.PROXY_USERNAME && process.env.PROXY_PASSWORD) {
+      launchOptions.proxy.username = process.env.PROXY_USERNAME;
+      launchOptions.proxy.password = process.env.PROXY_PASSWORD;
+    }
+    console.log(`[*] Using configured proxy: ${process.env.PROXY_SERVER}`);
+  }
+
+  return await chromium.launch(launchOptions);
+}
+
+/**
+ * 1. Stream Interceptor API Endpoint
+ */
 app.get('/api/extract', async (req, res) => {
-  const { type = 'movie', id, season = '1', episode = '1' } = req.query;
+  const { url, type = 'movie', id, season = '1', episode = '1' } = req.query;
 
-  if (!id) {
-    return res.status(400).json({ success: false, error: 'TMDB ID required' });
+  let targetUrl = url;
+  if (!targetUrl) {
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'Provide a target URL or media ID' });
+    }
+    targetUrl = `https://vidlink.pro/${type}/${id}${type === 'tv' ? `/${season}/${episode}` : ''}?autoplay=true`;
   }
-
-  let embedUrl = `https://vidlink.pro/${type}/${id}`;
-  if (type === 'tv') {
-    embedUrl += `/${season}/${episode}`;
-  }
-  embedUrl += '?autoplay=true';
 
   let browser = null;
 
   try {
-    console.log(`[+] Intercepting VidLink: ${embedUrl}`);
+    console.log(`[+] [${new Date().toISOString()}] Intercepting target: ${targetUrl}`);
 
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--no-first-run',
-        '--use-gl=swiftshader'
-      ]
-    });
+    browser = await launchBrowser();
 
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 720 },
-      deviceScaleFactor: 1,
-      isMobile: false,
-      hasTouch: false,
-      locale: 'en-US',
-      timezoneId: 'America/New_York'
+      viewport: { width: 1280, height: 720 }
     });
 
     const page = await context.newPage();
-
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    });
-
     let detectedStreamUrl = null;
 
+    // Listen to network request traffic
     page.on('request', (request) => {
-      const url = request.url();
-      if ((url.includes('.m3u8') || url.includes('/playlist/') || url.includes('/hls/') || url.includes('.mpd')) && !detectedStreamUrl) {
-        console.log(`[!] Captured Stream Request: ${url}`);
-        detectedStreamUrl = url;
+      const reqUrl = request.url();
+      if ((reqUrl.includes('.m3u8') || reqUrl.includes('/playlist/') || reqUrl.includes('/hls/')) && !detectedStreamUrl) {
+        console.log(`[!] Captured Stream Request: ${reqUrl}`);
+        detectedStreamUrl = reqUrl;
       }
     });
 
-    page.on('response', async (response) => {
+    // Listen to network response headers
+    page.on('response', (response) => {
       if (detectedStreamUrl) return;
-      const url = response.url();
       const contentType = response.headers()['content-type'] || '';
-
-      if (contentType.includes('mpegurl') || contentType.includes('x-mpegurl') || contentType.includes('vnd.apple.mpegurl')) {
-        console.log(`[!] Captured Stream Content-Type: ${url}`);
-        detectedStreamUrl = url;
+      if (contentType.includes('mpegurl') || contentType.includes('x-mpegurl')) {
+        console.log(`[!] Captured Stream Response: ${response.url()}`);
+        detectedStreamUrl = response.url();
       }
     });
 
-    await page.goto(embedUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
     await page.waitForTimeout(4000);
 
+    // Fallback interaction if stream isn't triggered automatically
     if (!detectedStreamUrl) {
-      console.log('[*] Attempting player click interactions...');
-      const mainPlay = page.locator('video, button, iframe, div[class*="play"], div[class*="player"]').first();
-      if (await mainPlay.isVisible().catch(() => false)) {
-        await mainPlay.click({ force: true }).catch(() => {});
+      const playBtn = page.locator('video, button, div[class*="play"]').first();
+      if (await playBtn.isVisible().catch(() => false)) {
+        await playBtn.click({ force: true }).catch(() => {});
         await page.waitForTimeout(3000);
-      }
-
-      for (const frame of page.frames()) {
-        if (detectedStreamUrl) break;
-        try {
-          const framePlay = frame.locator('video, button, div[class*="play"]').first();
-          if (await framePlay.isVisible().catch(() => false)) {
-            await framePlay.click({ force: true }).catch(() => {});
-            await page.waitForTimeout(2000);
-          }
-        } catch (e) {}
       }
     }
 
@@ -116,7 +111,6 @@ app.get('/api/extract', async (req, res) => {
 
       return res.json({
         success: true,
-        media: { type, id, season: type === 'tv' ? season : undefined, episode: type === 'tv' ? episode : undefined },
         stream: {
           raw: detectedStreamUrl,
           proxied: proxiedStreamUrl,
@@ -126,7 +120,7 @@ app.get('/api/extract', async (req, res) => {
     } else {
       return res.status(404).json({
         success: false,
-        error: 'Stream link not detected. VidLink may be blocking datacenter IPs or requiring manual Cloudflare verification.'
+        error: 'Stream not detected. Render datacenter IPs are blocked by Cloudflare WAF. Please add a PROXY_SERVER environment variable in Render settings.'
       });
     }
 
@@ -136,6 +130,9 @@ app.get('/api/extract', async (req, res) => {
   }
 });
 
+/**
+ * 2. CORS & Manifest Proxy Endpoint
+ */
 app.get('/api/proxy', async (req, res) => {
   const { url } = req.query;
 
@@ -144,7 +141,7 @@ app.get('/api/proxy', async (req, res) => {
   try {
     const targetUrl = decodeURIComponent(url);
 
-    const response = await axios({
+    const axiosOptions = {
       method: 'GET',
       url: targetUrl,
       headers: {
@@ -155,7 +152,9 @@ app.get('/api/proxy', async (req, res) => {
       responseType: 'arraybuffer',
       timeout: 15000,
       validateStatus: () => true
-    });
+    };
+
+    const response = await axios(axiosOptions);
 
     const contentType = response.headers['content-type'] || 'application/vnd.apple.mpegurl';
     res.setHeader('Content-Type', contentType);
